@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Internet Speed Monitor
+Internet Speed Monitor + Network Device Discovery
 
-A comprehensive tool for monitoring internet speed, storing data, 
-visualizing trends, and generating reports.
+Monitors internet speed, discovers connected devices on the local subnet
+during the wait interval, stores everything, visualizes trends, and
+generates a PDF report.
 
 Dependencies:
-pip install speedtest-cli matplotlib plotly pandas reportlab sqlite3
+pip install speedtest-cli matplotlib plotly pandas reportlab
 
 Usage:
 python speed_monitor.py [--interval MINUTES] [--duration HOURS] [--live-plot]
@@ -17,18 +18,21 @@ Author: AI Assistant
 import time
 import sqlite3
 import csv
-import json
 import argparse
 import threading
 import signal
 import sys
+import socket
+import subprocess
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
+# Use a GUI backend (TkAgg). Make sure python3-tk is installed on Linux.
 import matplotlib
 matplotlib.use("TkAgg")
-
 
 import speedtest
 import matplotlib.pyplot as plt
@@ -36,14 +40,11 @@ import matplotlib.dates as mdates
 from matplotlib.animation import FuncAnimation
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pandas as pd
-from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
-
-  
 
 
 class SpeedTestError(Exception):
@@ -53,44 +54,52 @@ class SpeedTestError(Exception):
 
 class InternetSpeedMonitor:
     """
-    A comprehensive internet speed monitoring system that tracks download/upload speeds
-    and ping latency, stores data persistently, and generates visualizations and reports.
+    Internet speed + local network device discovery.
+    Tracks download/upload/ping and number of connected devices; stores to SQLite/CSV;
+    creates Matplotlib and Plotly plots; generates a PDF report.
     """
-    
+
     def __init__(self, db_path: str = "speed_data.db", csv_path: str = "speed_data.csv"):
         self.db_path = db_path
         self.csv_path = csv_path
         self.running = False
         self.data_lock = threading.Lock()
-        
-        # Initialize database
+
+        # Initialize database (with migration to add connected_devices if missing)
         self._init_database()
-        
-        # Data for live plotting
-        self.timestamps = []
-        self.download_speeds = []
-        self.upload_speeds = []
-        self.ping_values = []
-        
-        # Statistics
+
+        # Data buffers for plotting
+        self.timestamps: List[datetime] = []
+        self.download_speeds: List[float] = []
+        self.upload_speeds: List[float] = []
+        self.ping_values: List[float] = []
+        self.device_counts: List[int] = []
+
+        # Stats
         self.stats = {
             'total_tests': 0,
             'failed_tests': 0,
-            'avg_download': 0,
-            'avg_upload': 0,
-            'avg_ping': 0,
-            'max_download': 0,
-            'max_upload': 0,
+            'avg_download': 0.0,
+            'avg_upload': 0.0,
+            'avg_ping': 0.0,
+            'avg_devices': 0.0,
+            'max_download': 0.0,
+            'max_upload': 0.0,
             'min_ping': float('inf'),
+            'max_devices': 0,
+            'min_devices': float('inf'),
             'start_time': None
         }
-        
+
+    # --------------------------
+    # Database init & migration
+    # --------------------------
     def _init_database(self) -> None:
-        """Initialize SQLite database with speed test results table"""
+        """Create table if not exists and ensure 'connected_devices' column exists."""
         try:
             conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
+            cur = conn.cursor()
+            cur.execute('''
                 CREATE TABLE IF NOT EXISTS speed_tests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
@@ -102,370 +111,424 @@ class InternetSpeedMonitor:
                 )
             ''')
             conn.commit()
+
+            # Check for connected_devices column; add if missing
+            cur.execute("PRAGMA table_info(speed_tests)")
+            cols = [row[1] for row in cur.fetchall()]
+            if 'connected_devices' not in cols:
+                cur.execute("ALTER TABLE speed_tests ADD COLUMN connected_devices INTEGER DEFAULT 0")
+                conn.commit()
+                print("✓ DB migrated: added 'connected_devices' column")
+
             conn.close()
-            print(f"✓ Database initialized: {self.db_path}")
+            print(f"✓ Database ready: {self.db_path}")
         except Exception as e:
             print(f"✗ Database initialization failed: {e}")
-            
+
+    # --------------------------
+    # Speed test
+    # --------------------------
     def test_speed(self) -> Optional[Dict]:
-        """
-        Perform a single speed test and return results
-        
-        Returns:
-            Dict with speed test results or None if failed
-        """
+        """Run a single speed test and return results dict."""
         try:
             print("🌐 Running speed test...")
             st = speedtest.Speedtest()
-            
-            # Get best server
             st.get_best_server()
             server_info = st.get_best_server()
-            
-            # Perform tests
-            download_speed = st.download() / 1_000_000  # Convert to Mbps
-            upload_speed = st.upload() / 1_000_000      # Convert to Mbps
+
+            download_speed = st.download() / 1_000_000  # Mbps
+            upload_speed = st.upload() / 1_000_000      # Mbps
             ping = st.results.ping
-            
+
             result = {
                 'timestamp': datetime.now().isoformat(),
                 'download_speed': round(download_speed, 2),
                 'upload_speed': round(upload_speed, 2),
                 'ping': round(ping, 2),
-                'server_name': server_info['sponsor'],
-                'server_location': f"{server_info['name']}, {server_info['country']}"
+                'server_name': server_info.get('sponsor', ''),
+                'server_location': f"{server_info.get('name','')}, {server_info.get('country','')}"
             }
-            
-            print(f"✓ Speed Test Complete:")
+
+            print("✓ Speed Test Complete:")
             print(f"  Download: {result['download_speed']} Mbps")
-            print(f"  Upload: {result['upload_speed']} Mbps")
-            print(f"  Ping: {result['ping']} ms")
-            print(f"  Server: {result['server_location']}")
-            
+            print(f"  Upload:   {result['upload_speed']} Mbps")
+            print(f"  Ping:     {result['ping']} ms")
+            print(f"  Server:   {result['server_location']}")
             return result
-            
+
         except Exception as e:
             print(f"✗ Speed test failed: {e}")
             self.stats['failed_tests'] += 1
             return None
-    
+
+    # --------------------------
+    # Network device discovery
+    # --------------------------
+    def _get_local_ip_and_subnet(self) -> (str, ipaddress.IPv4Network):
+        """Determine local IP and /24 subnet."""
+        try:
+            # UDP trick to learn outbound interface IP
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            local_ip = sock.getsockname()[0]
+            sock.close()
+        except Exception:
+            local_ip = socket.gethostbyname(socket.gethostname())
+
+        # Use a /24 by default (typical home/office)
+        net = ipaddress.ip_network(local_ip + "/24", strict=False)
+        return local_ip, net
+
+    def _ping(self, ip: str, timeout_sec: float = 1.0) -> bool:
+        """Ping an IP once; return True if alive."""
+        # Cross-platform ping
+        if sys.platform.startswith("win"):
+            cmd = ["ping", "-n", "1", "-w", str(int(timeout_sec * 1000)), ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(int(timeout_sec)), ip]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def discover_devices(self, max_workers: int = 128, timeout_sec: float = 1.0) -> int:
+        """
+        Scan the local /24 subnet by pinging all hosts in parallel.
+        Returns the number of responding devices (including our own).
+        """
+        try:
+            local_ip, subnet = self._get_local_ip_and_subnet()
+            print(f"🔎 Scanning subnet: {subnet} (local IP {local_ip})")
+            ips = [str(h) for h in subnet.hosts()]
+
+            alive = 0
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(self._ping, ip, timeout_sec): ip for ip in ips if ip != local_ip}
+                for fut in as_completed(futures):
+                    if fut.result():
+                        alive += 1
+
+            # Include our own device
+            total = alive + 1
+            print(f"✓ Devices found: {total}")
+            return total
+        except Exception as e:
+            print(f"⚠ Device discovery failed: {e}")
+            # At least we know our own device is present
+            return 1
+
+    # --------------------------
+    # Storage
+    # --------------------------
     def store_result(self, result: Dict) -> None:
-        """Store test result in both database and CSV file"""
+        """Persist to SQLite + CSV and update in-memory arrays/stats."""
         if not result:
             return
-            
+
         with self.data_lock:
             try:
-                # Store in SQLite database
+                # DB
                 conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                cursor.execute('''
+                cur = conn.cursor()
+                cur.execute('''
                     INSERT INTO speed_tests 
-                    (timestamp, download_speed, upload_speed, ping, server_name, server_location)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (timestamp, download_speed, upload_speed, ping, server_name, server_location, connected_devices)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     result['timestamp'],
                     result['download_speed'],
                     result['upload_speed'],
                     result['ping'],
-                    result['server_name'],
-                    result['server_location']
+                    result.get('server_name', ''),
+                    result.get('server_location', ''),
+                    result.get('connected_devices', 0),
                 ))
                 conn.commit()
                 conn.close()
-                
-                # Store in CSV file
+
+                # CSV
                 file_exists = Path(self.csv_path).exists()
-                with open(self.csv_path, 'a', newline='') as csvfile:
-                    fieldnames = ['timestamp', 'download_speed', 'upload_speed', 'ping', 'server_name', 'server_location']
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    
+                with open(self.csv_path, 'a', newline='') as f:
+                    fieldnames = [
+                        'timestamp', 'download_speed', 'upload_speed', 'ping',
+                        'server_name', 'server_location', 'connected_devices'
+                    ]
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
                     if not file_exists:
                         writer.writeheader()
                     writer.writerow(result)
-                
-                # Update live data for plotting
-                timestamp = datetime.fromisoformat(result['timestamp'])
-                self.timestamps.append(timestamp)
+
+                # In-memory
+                ts = datetime.fromisoformat(result['timestamp'])
+                self.timestamps.append(ts)
                 self.download_speeds.append(result['download_speed'])
                 self.upload_speeds.append(result['upload_speed'])
                 self.ping_values.append(result['ping'])
-                
-                # Update statistics
+                self.device_counts.append(result.get('connected_devices', 0))
+
                 self._update_stats(result)
-                
-                print(f"✓ Data stored successfully")
-                
+                print("✓ Data stored")
             except Exception as e:
                 print(f"✗ Failed to store data: {e}")
-    
+
     def _update_stats(self, result: Dict) -> None:
-        """Update running statistics"""
+        """Update running statistics."""
         self.stats['total_tests'] += 1
-        
         if self.stats['start_time'] is None:
             self.stats['start_time'] = result['timestamp']
-        
-        # Running averages
+
         n = self.stats['total_tests']
-        self.stats['avg_download'] = ((self.stats['avg_download'] * (n-1)) + result['download_speed']) / n
-        self.stats['avg_upload'] = ((self.stats['avg_upload'] * (n-1)) + result['upload_speed']) / n
-        self.stats['avg_ping'] = ((self.stats['avg_ping'] * (n-1)) + result['ping']) / n
-        
-        # Max/Min values
+        self.stats['avg_download'] = ((self.stats['avg_download'] * (n - 1)) + result['download_speed']) / n
+        self.stats['avg_upload'] = ((self.stats['avg_upload'] * (n - 1)) + result['upload_speed']) / n
+        self.stats['avg_ping'] = ((self.stats['avg_ping'] * (n - 1)) + result['ping']) / n
+        devices = result.get('connected_devices', 0)
+        self.stats['avg_devices'] = ((self.stats['avg_devices'] * (n - 1)) + devices) / n
+
         self.stats['max_download'] = max(self.stats['max_download'], result['download_speed'])
         self.stats['max_upload'] = max(self.stats['max_upload'], result['upload_speed'])
         self.stats['min_ping'] = min(self.stats['min_ping'], result['ping'])
-    
+        self.stats['max_devices'] = max(self.stats['max_devices'], devices)
+        self.stats['min_devices'] = min(self.stats['min_devices'], devices)
+
     def load_existing_data(self) -> None:
-        """Load existing data from database for visualization"""
+        """Load existing rows into memory (handles legacy rows without devices)."""
         try:
             conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute('SELECT timestamp, download_speed, upload_speed, ping FROM speed_tests ORDER BY timestamp')
-            rows = cursor.fetchall()
+            cur = conn.cursor()
+            cur.execute('SELECT timestamp, download_speed, upload_speed, ping, connected_devices FROM speed_tests ORDER BY timestamp')
+            rows = cur.fetchall()
             conn.close()
-            
+
             with self.data_lock:
                 self.timestamps.clear()
                 self.download_speeds.clear()
                 self.upload_speeds.clear()
                 self.ping_values.clear()
-                
+                self.device_counts.clear()
+
                 for row in rows:
-                    timestamp = datetime.fromisoformat(row[0])
-                    self.timestamps.append(timestamp)
+                    ts = datetime.fromisoformat(row[0])
+                    self.timestamps.append(ts)
                     self.download_speeds.append(row[1])
                     self.upload_speeds.append(row[2])
                     self.ping_values.append(row[3])
-            
+                    self.device_counts.append(row[4] if row[4] is not None else 0)
+
             print(f"✓ Loaded {len(rows)} existing records")
-            
         except Exception as e:
             print(f"⚠ Could not load existing data: {e}")
-    
+
+    # --------------------------
+    # Plotting
+    # --------------------------
     def create_static_plots(self, save_path: str = "speed_plots.png") -> str:
-        """Create static plots and save to file"""
+        """Create static plots; annotate markers with device counts."""
         if not self.timestamps:
             print("⚠ No data available for plotting")
             return ""
-        
+
         with self.data_lock:
-            timestamps = self.timestamps.copy()
-            download_speeds = self.download_speeds.copy()
-            upload_speeds = self.upload_speeds.copy()
-            ping_values = self.ping_values.copy()
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        
-        # Speed plot
-        ax1.plot(timestamps, download_speeds, label='Download Speed', marker='o', linewidth=2, markersize=4)
-        ax1.plot(timestamps, upload_speeds, label='Upload Speed', marker='s', linewidth=2, markersize=4)
-        ax1.set_ylabel('Speed (Mbps)')
-        ax1.set_title('Internet Speed Over Time')
+            ts = self.timestamps.copy()
+            dl = self.download_speeds.copy()
+            ul = self.upload_speeds.copy()
+            pg = self.ping_values.copy()
+            devs = self.device_counts.copy()
+
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
+
+        # Speeds
+        ax1.plot(ts, dl, label='Download', marker='o', linewidth=2)
+        ax1.plot(ts, ul, label='Upload', marker='s', linewidth=2)
+        for i, (x, y_dl, y_ul, d) in enumerate(zip(ts, dl, ul, devs)):
+            y = max(y_dl, y_ul)
+            ax1.annotate(f'{d}', (x, y), xytext=(0, 8 if i % 2 == 0 else -10),
+                         textcoords='offset points', ha='center', fontsize=8, alpha=0.8)
+        ax1.set_ylabel('Mbps')
+        ax1.set_title('Internet Speed Over Time (annotated with connected devices)')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        
-        # Format x-axis
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-        
-        # Ping plot
-        ax2.plot(timestamps, ping_values, label='Ping', color='red', marker='^', linewidth=2, markersize=4)
-        ax2.set_ylabel('Ping (ms)')
-        ax2.set_xlabel('Time')
-        ax2.set_title('Ping Latency Over Time')
+
+        # Ping
+        ax2.plot(ts, pg, label='Ping (ms)', marker='^', linewidth=2)
+        for i, (x, y, d) in enumerate(zip(ts, pg, devs)):
+            ax2.annotate(f'{d}', (x, y), xytext=(0, 8 if i % 2 == 0 else -10),
+                         textcoords='offset points', ha='center', fontsize=8, alpha=0.8)
+        ax2.set_ylabel('ms')
+        ax2.set_title('Ping Over Time (annotated with connected devices)')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
-        
-        # Format x-axis
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax2.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-        
+
+        # Devices
+        ax3.plot(ts, devs, label='Connected Devices', marker='d', linewidth=2)
+        ax3.set_ylabel('Devices')
+        ax3.set_xlabel('Time')
+        ax3.set_title('Connected Devices Over Time')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+
+        for ax in (ax1, ax2, ax3):
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+
         plt.tight_layout()
-        plt.xticks(rotation=45)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"✓ Static plots saved: {save_path}")
         return save_path
-    
+
     def create_interactive_plot(self, save_path: str = "interactive_speed_plot.html") -> str:
-        """Create interactive Plotly visualization"""
+        """Plotly interactive visualization with device counts in hover."""
         if not self.timestamps:
             print("⚠ No data available for plotting")
             return ""
-        
+
         with self.data_lock:
-            timestamps = self.timestamps.copy()
-            download_speeds = self.download_speeds.copy()
-            upload_speeds = self.upload_speeds.copy()
-            ping_values = self.ping_values.copy()
-        
-        # Create subplots
+            ts = self.timestamps.copy()
+            dl = self.download_speeds.copy()
+            ul = self.upload_speeds.copy()
+            pg = self.ping_values.copy()
+            devs = self.device_counts.copy()
+
         fig = make_subplots(
-            rows=2, cols=1,
-            subplot_titles=('Internet Speed Over Time', 'Ping Latency Over Time'),
-            specs=[[{"secondary_y": False}], [{"secondary_y": False}]],
-            vertical_spacing=0.1
+            rows=3, cols=1,
+            subplot_titles=('Internet Speed Over Time', 'Ping Over Time', 'Connected Devices Over Time'),
+            specs=[[{"secondary_y": False}], [{"secondary_y": False}], [{"secondary_y": False}]],
+            vertical_spacing=0.08
         )
-        
-        # Add speed traces
-        fig.add_trace(
-            go.Scatter(x=timestamps, y=download_speeds, name='Download Speed',
-                      line=dict(color='blue', width=2), mode='lines+markers'),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=timestamps, y=upload_speeds, name='Upload Speed',
-                      line=dict(color='green', width=2), mode='lines+markers'),
-            row=1, col=1
-        )
-        
-        # Add ping trace
-        fig.add_trace(
-            go.Scatter(x=timestamps, y=ping_values, name='Ping',
-                      line=dict(color='red', width=2), mode='lines+markers'),
-            row=2, col=1
-        )
-        
-        # Update layout
-        fig.update_layout(
-            title="Internet Speed Monitor Dashboard",
-            showlegend=True,
-            height=800
-        )
-        
-        fig.update_yaxes(title_text="Speed (Mbps)", row=1, col=1)
-        fig.update_yaxes(title_text="Ping (ms)", row=2, col=1)
-        fig.update_xaxes(title_text="Time", row=2, col=1)
-        
+
+        fig.add_trace(go.Scatter(x=ts, y=dl, name='Download',
+                                 mode='lines+markers',
+                                 hovertext=[f"Download: {v} Mbps<br>Devices: {d}" for v, d in zip(dl, devs)],
+                                 hoverinfo='text'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=ul, name='Upload',
+                                 mode='lines+markers',
+                                 hovertext=[f"Upload: {v} Mbps<br>Devices: {d}" for v, d in zip(ul, devs)],
+                                 hoverinfo='text'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=pg, name='Ping',
+                                 mode='lines+markers',
+                                 hovertext=[f"Ping: {v} ms<br>Devices: {d}" for v, d in zip(pg, devs)],
+                                 hoverinfo='text'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=ts, y=devs, name='Devices',
+                                 mode='lines+markers'), row=3, col=1)
+
+        fig.update_layout(title="Internet Speed + Network Devices Dashboard", height=1000, showlegend=True)
+        fig.update_yaxes(title_text="Mbps", row=1, col=1)
+        fig.update_yaxes(title_text="ms", row=2, col=1)
+        fig.update_yaxes(title_text="Devices", row=3, col=1)
+        fig.update_xaxes(title_text="Time", row=3, col=1)
+
         fig.write_html(save_path)
         print(f"✓ Interactive plot saved: {save_path}")
         return save_path
-    
+
     def start_live_plot(self) -> None:
-        """Start live updating matplotlib plot in separate thread"""
-        def update_plot(frame):
+        """Live-updating Matplotlib plot (runs in a background thread if chosen)."""
+        def update_plot(_frame):
             if not self.timestamps:
                 return
-            
             with self.data_lock:
-                timestamps = self.timestamps.copy()
-                download_speeds = self.download_speeds.copy()
-                upload_speeds = self.upload_speeds.copy()
-                ping_values = self.ping_values.copy()
-            
-            # Clear and redraw
-            ax1.clear()
-            ax2.clear()
-            
-            # Speed plot
-            ax1.plot(timestamps, download_speeds, label='Download Speed', marker='o', linewidth=2)
-            ax1.plot(timestamps, upload_speeds, label='Upload Speed', marker='s', linewidth=2)
-            ax1.set_ylabel('Speed (Mbps)')
-            ax1.set_title(f'Internet Speed Over Time (Tests: {len(timestamps)})')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            
-            # Ping plot
-            ax2.plot(timestamps, ping_values, label='Ping', color='red', marker='^', linewidth=2)
-            ax2.set_ylabel('Ping (ms)')
-            ax2.set_xlabel('Time')
-            ax2.set_title('Ping Latency Over Time')
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-            
-            # Format x-axis if we have data
-            if timestamps:
-                for ax in [ax1, ax2]:
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-                    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
-        
-        # Set up the plot
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+                ts = self.timestamps.copy()
+                dl = self.download_speeds.copy()
+                ul = self.upload_speeds.copy()
+                pg = self.ping_values.copy()
+                devs = self.device_counts.copy()
+
+            ax1.clear(); ax2.clear(); ax3.clear()
+
+            ax1.plot(ts, dl, label='Download', marker='o', linewidth=2)
+            ax1.plot(ts, ul, label='Upload', marker='s', linewidth=2)
+            for i, (x, y_dl, y_ul, d) in enumerate(zip(ts, dl, ul, devs)):
+                ax1.annotate(f'{d}', (x, max(y_dl, y_ul)),
+                             xytext=(0, 8 if i % 2 == 0 else -10),
+                             textcoords='offset points', ha='center', fontsize=8, alpha=0.8)
+            ax1.set_ylabel('Mbps'); ax1.set_title(f'Internet Speed (n={len(ts)})'); ax1.legend(); ax1.grid(True, alpha=0.3)
+
+            ax2.plot(ts, pg, label='Ping', marker='^', linewidth=2)
+            for i, (x, y, d) in enumerate(zip(ts, pg, devs)):
+                ax2.annotate(f'{d}', (x, y),
+                             xytext=(0, 8 if i % 2 == 0 else -10),
+                             textcoords='offset points', ha='center', fontsize=8, alpha=0.8)
+            ax2.set_ylabel('ms'); ax2.set_title('Ping'); ax2.legend(); ax2.grid(True, alpha=0.3)
+
+            ax3.plot(ts, devs, label='Devices', marker='d', linewidth=2)
+            ax3.set_ylabel('Devices'); ax3.set_xlabel('Time'); ax3.set_title('Connected Devices'); ax3.legend(); ax3.grid(True, alpha=0.3)
+
+            for ax in (ax1, ax2, ax3):
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12))
         plt.tight_layout()
-        
-        # Create animation
-        self.ani = FuncAnimation(fig, update_plot, interval=5000, cache_frame_data=False)
-        
-        # Show plot
+        # Keep a reference to avoid garbage collection warnings
+        self.ani = FuncAnimation(fig, update_plot, interval=10000, cache_frame_data=False)
         plt.show()
-    
+
+    # --------------------------
+    # Reporting
+    # --------------------------
     def generate_report(self, output_path: str = "speed_report.pdf") -> str:
-        """Generate comprehensive PDF report"""
+        """Generate a PDF report including device counts."""
         try:
             doc = SimpleDocTemplate(output_path, pagesize=A4)
             styles = getSampleStyleSheet()
             story = []
-            
-            # Title
-            title_style = ParagraphStyle(
-                'CustomTitle',
-                parent=styles['Heading1'],
-                fontSize=24,
-                spaceAfter=30,
-                alignment=1  # Center
-            )
-            story.append(Paragraph("Internet Speed Monitor Report", title_style))
+
+            title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=22, spaceAfter=20, alignment=1)
+            story.append(Paragraph("Internet Speed Monitor Report<br/>with Network Device Discovery", title_style))
             story.append(Spacer(1, 12))
-            
-            # Summary statistics
+
             if self.stats['total_tests'] > 0:
                 summary_data = [
                     ['Metric', 'Value'],
-                    ['Total Tests Performed', str(self.stats['total_tests'])],
+                    ['Total Tests', str(self.stats['total_tests'])],
                     ['Failed Tests', str(self.stats['failed_tests'])],
                     ['Success Rate', f"{((self.stats['total_tests'] - self.stats['failed_tests']) / self.stats['total_tests'] * 100):.1f}%"],
-                    ['Average Download Speed', f"{self.stats['avg_download']:.2f} Mbps"],
-                    ['Average Upload Speed', f"{self.stats['avg_upload']:.2f} Mbps"],
-                    ['Average Ping', f"{self.stats['avg_ping']:.2f} ms"],
-                    ['Maximum Download Speed', f"{self.stats['max_download']:.2f} Mbps"],
-                    ['Maximum Upload Speed', f"{self.stats['max_upload']:.2f} Mbps"],
-                    ['Minimum Ping', f"{self.stats['min_ping']:.2f} ms"],
+                    ['Avg Download', f"{self.stats['avg_download']:.2f} Mbps"],
+                    ['Avg Upload', f"{self.stats['avg_upload']:.2f} Mbps"],
+                    ['Avg Ping', f"{self.stats['avg_ping']:.2f} ms"],
+                    ['Avg Devices', f"{self.stats['avg_devices']:.1f}"],
+                    ['Max Download', f"{self.stats['max_download']:.2f} Mbps"],
+                    ['Max Upload', f"{self.stats['max_upload']:.2f} Mbps"],
+                    ['Min Ping', f"{self.stats['min_ping']:.2f} ms"],
+                    ['Max Devices', f"{self.stats['max_devices']}"],
+                    ['Min Devices', f"{self.stats['min_devices']}"],
                 ]
-                
-                table = Table(summary_data)
-                table.setStyle(TableStyle([
+                tbl = Table(summary_data)
+                tbl.setStyle(TableStyle([
                     ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
                     ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                     ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                     ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 14),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('FONTSIZE', (0, 0), (-1, 0), 12),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
                     ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
                     ('GRID', (0, 0), (-1, -1), 1, colors.black)
                 ]))
-                
                 story.append(Paragraph("Summary Statistics", styles['Heading2']))
-                story.append(table)
-                story.append(Spacer(1, 20))
-            
-            # Create and include plots
+                story.append(tbl)
+                story.append(Spacer(1, 18))
+
             plot_path = self.create_static_plots("temp_plot_for_report.png")
             if plot_path and Path(plot_path).exists():
-                story.append(Paragraph("Speed Trends", styles['Heading2']))
-                img = Image(plot_path, width=7*inch, height=5.8*inch)
-                story.append(img)
-                story.append(Spacer(1, 20))
-            
-            # Recent test results (last 20)
+                story.append(Paragraph("Trends & Annotations", styles['Heading2']))
+                story.append(Image(plot_path, width=7*inch, height=8.4*inch))
+                story.append(Spacer(1, 18))
+
             if self.timestamps:
-                story.append(Paragraph("Recent Test Results", styles['Heading2']))
-                
-                recent_data = [['Timestamp', 'Download (Mbps)', 'Upload (Mbps)', 'Ping (ms)']]
-                
-                # Get last 20 results
-                start_idx = max(0, len(self.timestamps) - 20)
-                for i in range(start_idx, len(self.timestamps)):
+                story.append(Paragraph("Recent Results", styles['Heading2']))
+                recent_data = [['Timestamp', 'Download (Mbps)', 'Upload (Mbps)', 'Ping (ms)', 'Devices']]
+                start = max(0, len(self.timestamps) - 20)
+                for i in range(start, len(self.timestamps)):
                     recent_data.append([
                         self.timestamps[i].strftime('%Y-%m-%d %H:%M:%S'),
                         f"{self.download_speeds[i]:.2f}",
                         f"{self.upload_speeds[i]:.2f}",
-                        f"{self.ping_values[i]:.2f}"
+                        f"{self.ping_values[i]:.2f}",
+                        str(self.device_counts[i]) if i < len(self.device_counts) else "0"
                     ])
-                
-                recent_table = Table(recent_data)
-                recent_table.setStyle(TableStyle([
+                recent_tbl = Table(recent_data)
+                recent_tbl.setStyle(TableStyle([
                     ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
                     ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                     ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -476,42 +539,31 @@ class InternetSpeedMonitor:
                     ('BACKGROUND', (0, 1), (-1, -1), colors.lightgrey),
                     ('GRID', (0, 0), (-1, -1), 1, colors.black)
                 ]))
-                
-                story.append(recent_table)
-            
-            # Generation info
-            story.append(Spacer(1, 30))
-            story.append(Paragraph(f"Report generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 
-                                  styles['Normal']))
-            
-            # Build PDF
+                story.append(recent_tbl)
+
+            story.append(Spacer(1, 20))
+            story.append(Paragraph(f"Report generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+
             doc.build(story)
-            
-            # Clean up temporary plot file
+
             if Path("temp_plot_for_report.png").exists():
                 Path("temp_plot_for_report.png").unlink()
-            
+
             print(f"✓ Report generated: {output_path}")
             return output_path
-            
         except Exception as e:
             print(f"✗ Report generation failed: {e}")
             return ""
-    
+
+    # --------------------------
+    # Orchestration
+    # --------------------------
     def monitor(self, interval_minutes: int = 5, duration_hours: Optional[int] = None) -> None:
-        """
-        Start monitoring internet speed at regular intervals
-        
-        Args:
-            interval_minutes: Time between tests in minutes
-            duration_hours: Total monitoring duration in hours (None for indefinite)
-        """
+        """Run tests on a schedule; discover devices between tests."""
         self.running = True
-        
-        # Load existing data
         self.load_existing_data()
-        
-        print(f"🚀 Starting Internet Speed Monitor")
+
+        print("🚀 Starting Internet Speed Monitor + Device Discovery")
         print(f"📊 Test interval: {interval_minutes} minutes")
         if duration_hours:
             print(f"⏱ Duration: {duration_hours} hours")
@@ -519,58 +571,63 @@ class InternetSpeedMonitor:
         else:
             print("⏱ Duration: Indefinite (Ctrl+C to stop)")
             end_time = None
-        
-        print(f"💾 Data will be saved to: {self.db_path} and {self.csv_path}")
+        print(f"💾 Data: {self.db_path}  |  {self.csv_path}")
         print("=" * 60)
-        
+
         try:
             while self.running:
                 if end_time and datetime.now() >= end_time:
                     print("\n⏰ Monitoring duration completed")
                     break
-                
-                # Run speed test
+
+                # 1) Speed test
                 result = self.test_speed()
+
+                # 2) During the wait period, discover devices (right after the test)
+                device_count = self.discover_devices()
+
+                # 3) Save combined result
                 if result:
+                    result['connected_devices'] = device_count
                     self.store_result(result)
-                
+
+                # 4) Sleep until next run (interruptible)
                 print(f"💤 Waiting {interval_minutes} minutes until next test...")
                 print("=" * 60)
-                
-                # Sleep with ability to interrupt
-                for _ in range(interval_minutes * 60):  # Convert to seconds
+                for _ in range(interval_minutes * 60):
                     if not self.running:
                         break
                     time.sleep(1)
-                    
+
         except KeyboardInterrupt:
             print("\n🛑 Monitoring stopped by user")
-        
+
         self.running = False
-        
-        # Generate final report
-        print("\n📊 Generating final report...")
+
+        print("\n📊 Generating final outputs...")
         self.generate_report()
         self.create_interactive_plot()
-        
-        print(f"\n📈 Final Statistics:")
+
+        print("\n📈 Final Statistics:")
         print(f"  Total tests: {self.stats['total_tests']}")
         print(f"  Failed tests: {self.stats['failed_tests']}")
         if self.stats['total_tests'] > 0:
-            print(f"  Success rate: {((self.stats['total_tests'] - self.stats['failed_tests']) / self.stats['total_tests'] * 100):.1f}%")
-            print(f"  Average download: {self.stats['avg_download']:.2f} Mbps")
-            print(f"  Average upload: {self.stats['avg_upload']:.2f} Mbps")
-            print(f"  Average ping: {self.stats['avg_ping']:.2f} ms")
-        
+            success = (self.stats['total_tests'] - self.stats['failed_tests']) / self.stats['total_tests'] * 100
+            print(f"  Success rate: {success:.1f}%")
+            print(f"  Avg download: {self.stats['avg_download']:.2f} Mbps")
+            print(f"  Avg upload:   {self.stats['avg_upload']:.2f} Mbps")
+            print(f"  Avg ping:     {self.stats['avg_ping']:.2f} ms")
+            print(f"  Avg devices:  {self.stats['avg_devices']:.1f}")
+            print(f"  Devices range: {self.stats['min_devices']}-{self.stats['max_devices']}")
         print("\n✅ Monitoring session completed!")
-    
+
     def stop(self) -> None:
-        """Stop the monitoring process"""
+        """Stop the monitoring process."""
         self.running = False
 
 
 def signal_handler(signum, frame):
-    """Handle Ctrl+C gracefully"""
+    """Handle Ctrl+C gracefully."""
     print("\n🛑 Received interrupt signal...")
     global monitor_instance
     if monitor_instance:
@@ -579,36 +636,26 @@ def signal_handler(signum, frame):
 
 
 def main():
-    """Main function to run the Internet Speed Monitor"""
-    parser = argparse.ArgumentParser(description='Internet Speed Monitor')
-    parser.add_argument('--interval', type=int, default=5, 
-                       help='Test interval in minutes (default: 5)')
-    parser.add_argument('--duration', type=int, 
-                       help='Monitoring duration in hours (default: indefinite)')
-    parser.add_argument('--live-plot', action='store_true',
-                       help='Show live updating plots')
-    parser.add_argument('--db-path', default='speed_data.db',
-                       help='Database file path (default: speed_data.db)')
-    parser.add_argument('--csv-path', default='speed_data.csv',
-                       help='CSV file path (default: speed_data.csv)')
-    
+    parser = argparse.ArgumentParser(description='Internet Speed Monitor + Network Device Discovery')
+    parser.add_argument('--interval', type=int, default=5, help='Test interval in minutes (default: 5)')
+    parser.add_argument('--duration', type=int, help='Monitoring duration in hours (default: indefinite)')
+    parser.add_argument('--live-plot', action='store_true', help='Show live updating plots')
+    parser.add_argument('--db-path', default='speed_data.db', help='Database file path (default: speed_data.db)')
+    parser.add_argument('--csv-path', default='speed_data.csv', help='CSV file path (default: speed_data.csv)')
     args = parser.parse_args()
-    
-    # Set up signal handler for graceful shutdown
+
     signal.signal(signal.SIGINT, signal_handler)
-    
-    # Create monitor instance
+
     global monitor_instance
     monitor_instance = InternetSpeedMonitor(args.db_path, args.csv_path)
-    
-    # Start live plotting in separate thread if requested
+
     if args.live_plot:
+        # Warning: GUI from background threads may print a warning; this still works on most setups.
         plot_thread = threading.Thread(target=monitor_instance.start_live_plot, daemon=True)
         plot_thread.start()
-        print("📈 Live plotting started in separate window")
-        time.sleep(2)  # Give plot window time to open
-    
-    # Start monitoring
+        print("📈 Live plotting started in a separate window")
+        time.sleep(2)
+
     monitor_instance.monitor(args.interval, args.duration)
 
 
