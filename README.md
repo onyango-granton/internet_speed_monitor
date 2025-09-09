@@ -39,24 +39,15 @@ A comprehensive Python-based internet speed monitoring tool that tracks download
 ### Prerequisites
 - Python 3.7 or higher
 - Internet connection for speed testing
+- Python Tinker Installed
 
-### Install Dependencies
-
-```bash
-# Install required packages
-pip install speedtest-cli matplotlib plotly pandas reportlab
-
-# Or install from requirements.txt (if provided)
-pip install -r requirements.txt
-```
-
-### Download the Script
+### Installation and Running
 
 ```bash
-# Clone or download the speed_monitor.py script
-wget https://example.com/speed_monitor.py
-# OR
-curl -O https://example.com/speed_monitor.py
+git clone https://github.com/onyango-granton/internet_speed_monitor.git
+sudo apt install python3-tk
+cd internet_speed_monitor
+python3 speed_monitor.py
 ```
 
 ## 🚀 Quick Start
